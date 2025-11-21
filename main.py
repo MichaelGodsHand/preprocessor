@@ -982,4 +982,4 @@ if __name__ == "__main__":
     print("  TWILIO_WHATSAPP_NUMBER=whatsapp:+14155238886")
     print("="*80 + "\n")
     
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8080)
