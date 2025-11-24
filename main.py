@@ -76,6 +76,16 @@ except ImportError:
     print("  pip install twilio")
     sys.exit(1)
 
+try:
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.base import MIMEBase
+    from email import encoders
+except ImportError:
+    print("Email libraries not found. Please ensure Python's email libraries are available.")
+    sys.exit(1)
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -169,6 +179,7 @@ else:
 class QueryRequest(BaseModel):
     query: str
     number: str
+    email: str
 
 
 def send_whatsapp_message(to_number: str, summary: str, pdf_url: str = None):
@@ -247,6 +258,121 @@ def send_whatsapp_message(to_number: str, summary: str, pdf_url: str = None):
         
     except Exception as e:
         print(f"  ✗ Failed to send WhatsApp message: {str(e)}")
+        return {
+            "status": "failed",
+            "error": str(e)
+        }
+
+
+def send_email_message(to_email: str, summary: str, pdf_url: str = None, query: str = None):
+    """
+    Send email with summary and optional PDF attachment.
+    
+    Args:
+        to_email: Recipient's email address
+        summary: Text summary to send
+        pdf_url: Optional URL of PDF to attach
+        query: The original query (for subject line)
+        
+    Returns:
+        dict: Status of email sending
+    """
+    # Get SMTP configuration from environment
+    smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_username = os.getenv("SMTP_USERNAME")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    smtp_from_email = os.getenv("SMTP_FROM_EMAIL", smtp_username)
+    
+    if not smtp_username or not smtp_password:
+        print(f"  ⚠ SMTP credentials not configured, skipping email")
+        return {"status": "skipped", "reason": "SMTP not configured"}
+    
+    try:
+        print(f"\n  📧 Sending email...")
+        print(f"    → To: {to_email}")
+        print(f"    → Summary length: {len(summary)} chars")
+        print(f"    → PDF URL: {pdf_url if pdf_url else 'None'}")
+        print(f"    → PDF attached: {'Yes' if pdf_url else 'No'}")
+        
+        # Create message
+        msg = MIMEMultipart()
+        msg['From'] = smtp_from_email
+        msg['To'] = to_email
+        msg['Subject'] = f"Query Response: {query[:50]}" if query else "Query Response"
+        
+        # Add body to email
+        body = f"""
+Hello,
+
+Thank you for your query. Please find the detailed information below:
+
+{summary}
+
+"""
+        
+        if pdf_url:
+            body += f"\nA detailed PDF document has been attached for your reference.\n"
+            body += f"\nYou can also access it directly here: {pdf_url}\n"
+        
+        body += """
+Best regards,
+Disha Communications AI Assistant
+"""
+        
+        msg.attach(MIMEText(body, 'plain'))
+        
+        # Attach PDF if URL is provided
+        if pdf_url:
+            try:
+                print(f"    → Downloading PDF from URL...")
+                pdf_response = requests.get(pdf_url, timeout=30)
+                pdf_response.raise_for_status()
+                
+                # Create attachment
+                part = MIMEBase('application', 'octet-stream')
+                part.set_payload(pdf_response.content)
+                encoders.encode_base64(part)
+                
+                # Extract filename from URL or use default
+                filename = pdf_url.split('/')[-1] if '/' in pdf_url else "query_response.pdf"
+                if not filename.endswith('.pdf'):
+                    filename = "query_response.pdf"
+                
+                part.add_header(
+                    'Content-Disposition',
+                    f'attachment; filename= {filename}'
+                )
+                msg.attach(part)
+                print(f"    → PDF attached: {filename}")
+            except Exception as pdf_error:
+                print(f"    ⚠ Could not attach PDF: {str(pdf_error)}")
+                # Continue without PDF attachment
+        
+        # Send email
+        print(f"    → Connecting to SMTP server...")
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()  # Enable encryption
+        server.login(smtp_username, smtp_password)
+        
+        print(f"    → Sending email...")
+        text = msg.as_string()
+        server.sendmail(smtp_from_email, to_email, text)
+        server.quit()
+        
+        print(f"  ✓ Email sent successfully!")
+        print(f"    → To: {to_email}")
+        print(f"    → Subject: {msg['Subject']}")
+        
+        return {
+            "status": "success",
+            "to": to_email,
+            "subject": msg['Subject'],
+            "pdf_attached": pdf_url is not None
+        }
+        
+    except Exception as e:
+        print(f"  ✗ Failed to send email: {str(e)}")
         return {
             "status": "failed",
             "error": str(e)
@@ -677,14 +803,16 @@ async def extract_text(
 @app.post("/query")
 async def query_documents(request: QueryRequest):
     """
-    Query the stored PDF documents using GPT-4o, ChromaDB, and send results via WhatsApp.
+    Query the stored PDF documents using GPT-4o, ChromaDB, and send results via WhatsApp and Email.
     """
     query = request.query
     user_number = request.number
+    user_email = request.email
     
     print("\n" + "="*80)
     print(f"🔍 Processing query: {query}")
     print(f"📱 User number: {user_number}")
+    print(f"📧 User email: {user_email}")
     print("="*80)
     
     try:
@@ -764,7 +892,8 @@ async def query_documents(request: QueryRequest):
                 "pages": [],
                 "s3_images": [],
                 "compiled_pdf_url": None,
-                "whatsapp_status": {"status": "skipped", "reason": "No results"}
+                "whatsapp_status": {"status": "skipped", "reason": "No results"},
+                "email_status": {"status": "skipped", "reason": "No results"}
             })
         
         documents = results['documents'][0]
@@ -926,12 +1055,16 @@ Respond in JSON format:
         # Send WhatsApp message
         whatsapp_status = send_whatsapp_message(user_number, summary, compiled_pdf_url)
         
+        # Send Email message
+        email_status = send_email_message(user_email, summary, compiled_pdf_url, query)
+        
         print(f"\n{'='*80}")
         print(f"✅ Query completed successfully")
         print(f"📄 Pages retrieved: {len(pages_used)}, Pages used: {len(pages_actually_used)}")
         print(f"🖼️  S3 images found: {len(s3_images)}")
         print(f"📚 Compiled PDF: {'Created' if compiled_pdf_url else 'Failed'}")
         print(f"📱 WhatsApp: {whatsapp_status['status']}")
+        print(f"📧 Email: {email_status['status']}")
         print(f"{'='*80}\n")
         
         return JSONResponse(content={
@@ -940,7 +1073,8 @@ Respond in JSON format:
             "pages": pages_actually_used,
             "s3_images": s3_images,
             "compiled_pdf_url": compiled_pdf_url,
-            "whatsapp_status": whatsapp_status
+            "whatsapp_status": whatsapp_status,
+            "email_status": email_status
         })
         
     except Exception as e:
@@ -971,6 +1105,11 @@ if __name__ == "__main__":
     else:
         print("✓ Twilio credentials configured")
     
+    if not os.getenv("SMTP_USERNAME") or not os.getenv("SMTP_PASSWORD"):
+        print("⚠️  WARNING: SMTP credentials not found!")
+    else:
+        print("✓ SMTP credentials configured")
+    
     print("\nPlease ensure your .env file contains:")
     print("  OPENAI_API_KEY=your-openai-api-key")
     print("  AWS_ACCESS_KEY_ID=your-aws-access-key")
@@ -980,6 +1119,11 @@ if __name__ == "__main__":
     print("  TWILIO_ACCOUNT_SID=your-twilio-account-sid")
     print("  TWILIO_AUTH_TOKEN=your-twilio-auth-token")
     print("  TWILIO_WHATSAPP_NUMBER=whatsapp:+14155238886")
+    print("  SMTP_SERVER=smtp.gmail.com (or your SMTP server)")
+    print("  SMTP_PORT=587")
+    print("  SMTP_USERNAME=your-email@gmail.com")
+    print("  SMTP_PASSWORD=your-app-password")
+    print("  SMTP_FROM_EMAIL=your-email@gmail.com (optional, defaults to SMTP_USERNAME)")
     print("="*80 + "\n")
     
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
