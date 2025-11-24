@@ -409,17 +409,37 @@ def get_calendar_service():
         raise ValueError("Google Calendar libraries not available")
     
     creds = None
-    token_path = os.path.join(os.path.dirname(__file__), 'token.pickle')
     
-    # Check if we have saved credentials
-    if os.path.exists(token_path):
-        with open(token_path, 'rb') as token:
-            creds = pickle.load(token)
+    # First, try to load token from environment variable (base64 encoded)
+    token_base64 = os.getenv('GOOGLE_CALENDAR_TOKEN')
+    if token_base64:
+        try:
+            import base64
+            token_data = base64.b64decode(token_base64)
+            creds = pickle.loads(token_data)
+            print("  ✓ Loaded calendar token from environment variable")
+        except Exception as e:
+            print(f"  ⚠ Failed to load token from environment: {e}")
+            creds = None
+    
+    # If no token from env, try to load from pickle file (fallback)
+    if not creds:
+        token_path = os.path.join(os.path.dirname(__file__), 'token.pickle')
+        if os.path.exists(token_path):
+            try:
+                with open(token_path, 'rb') as token:
+                    creds = pickle.load(token)
+                print("  ✓ Loaded calendar token from pickle file")
+            except Exception as e:
+                print(f"  ⚠ Failed to load token from pickle file: {e}")
+                creds = None
     
     # If no valid credentials, authenticate
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
+            print("  🔄 Refreshing expired token...")
             creds.refresh(Request())
+            print("  ✓ Token refreshed successfully")
         else:
             # Load credentials from environment variable
             credentials_json = os.getenv('GOOGLE_CALENDAR_CREDENTIALS')
@@ -432,11 +452,16 @@ def get_calendar_service():
             credentials_dict = json.loads(credentials_json)
             flow = InstalledAppFlow.from_client_config(
                 credentials_dict, CALENDAR_SCOPES)
+            print("  🔐 Starting OAuth flow...")
             creds = flow.run_local_server(port=0)
+            print("  ✓ OAuth authentication completed")
         
-        # Save credentials for future use
+        # Save credentials for future use (both to env format and pickle file)
+        # Note: The base64 token should be updated in .env manually after first auth
+        token_path = os.path.join(os.path.dirname(__file__), 'token.pickle')
         with open(token_path, 'wb') as token:
             pickle.dump(creds, token)
+        print("  ✓ Token saved to pickle file")
     
     return build('calendar', 'v3', credentials=creds)
 
@@ -1400,6 +1425,7 @@ if __name__ == "__main__":
     print("  SMTP_PASSWORD=your-app-password")
     print("  SMTP_FROM_EMAIL=your-email@gmail.com (optional, defaults to SMTP_USERNAME)")
     print("  GOOGLE_CALENDAR_CREDENTIALS=your-google-calendar-credentials-json")
+    print("  GOOGLE_CALENDAR_TOKEN=base64-encoded-token-pickle (optional, for pre-authenticated tokens)")
     print("="*80 + "\n")
     
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
