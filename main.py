@@ -86,6 +86,18 @@ except ImportError:
     print("Email libraries not found. Please ensure Python's email libraries are available.")
     sys.exit(1)
 
+try:
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+    import pickle
+    GOOGLE_CALENDAR_AVAILABLE = True
+except ImportError:
+    print("Google Calendar libraries not found. Please install them using:")
+    print("  pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client")
+    GOOGLE_CALENDAR_AVAILABLE = False
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -135,6 +147,9 @@ collection = chroma_client.get_or_create_collection(
     metadata={"hnsw:space": "cosine"}
 )
 
+# Google Calendar configuration
+CALENDAR_SCOPES = ['https://www.googleapis.com/auth/calendar']
+
 # Initialize OpenAI client (with error handling)
 openai_api_key = os.getenv("OPENAI_API_KEY")
 if not openai_api_key:
@@ -180,6 +195,15 @@ class QueryRequest(BaseModel):
     query: str
     number: str
     email: str
+
+# Pydantic model for calendar request
+class CalendarRequest(BaseModel):
+    title: str
+    date: str  # Format: YYYY-MM-DD
+    start_time: str  # Format: HH:MM
+    end_time: str  # Format: HH:MM
+    description: str = ""
+    location: str = ""
 
 
 def send_whatsapp_message(to_number: str, summary: str, pdf_url: str = None):
@@ -377,6 +401,152 @@ Disha Communications AI Assistant
             "status": "failed",
             "error": str(e)
         }
+
+
+def get_calendar_service():
+    """Authenticate and return Google Calendar service"""
+    if not GOOGLE_CALENDAR_AVAILABLE:
+        raise ValueError("Google Calendar libraries not available")
+    
+    creds = None
+    token_path = os.path.join(os.path.dirname(__file__), 'token.pickle')
+    
+    # Check if we have saved credentials
+    if os.path.exists(token_path):
+        with open(token_path, 'rb') as token:
+            creds = pickle.load(token)
+    
+    # If no valid credentials, authenticate
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            # Load credentials from environment variable
+            credentials_json = os.getenv('GOOGLE_CALENDAR_CREDENTIALS')
+            
+            if not credentials_json:
+                raise ValueError("GOOGLE_CALENDAR_CREDENTIALS not found in .env file")
+            
+            # Parse JSON and create flow
+            import json
+            credentials_dict = json.loads(credentials_json)
+            flow = InstalledAppFlow.from_client_config(
+                credentials_dict, CALENDAR_SCOPES)
+            creds = flow.run_local_server(port=0)
+        
+        # Save credentials for future use
+        with open(token_path, 'wb') as token:
+            pickle.dump(creds, token)
+    
+    return build('calendar', 'v3', credentials=creds)
+
+
+def check_calendar_conflicts(date: str, start_time: str, end_time: str, timezone: str = 'Asia/Kolkata'):
+    """
+    Check if there are any events during the specified time period
+    
+    Args:
+        date: Date in 'YYYY-MM-DD' format
+        start_time: Time in 'HH:MM' format
+        end_time: Time in 'HH:MM' format
+        timezone: Timezone (default: 'Asia/Kolkata')
+    
+    Returns:
+        List of conflicting events with details
+    """
+    try:
+        service = get_calendar_service()
+        
+        # Build datetime strings in RFC3339 format
+        # For Asia/Kolkata timezone, we need to add +05:30 offset
+        time_min = f"{date}T{start_time}:00+05:30"
+        time_max = f"{date}T{end_time}:00+05:30"
+        
+        events_result = service.events().list(
+            calendarId='primary',
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        
+        events = events_result.get('items', [])
+        
+        if not events:
+            return []
+        
+        # Format conflicting events for response
+        conflicts = []
+        for event in events:
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            end = event['end'].get('dateTime', event['end'].get('date'))
+            conflict_info = {
+                'title': event.get('summary', 'Untitled Event'),
+                'start': start,
+                'end': end,
+                'location': event.get('location', ''),
+                'description': event.get('description', '')
+            }
+            conflicts.append(conflict_info)
+        
+        return conflicts
+        
+    except Exception as e:
+        print(f"✗ Error checking conflicts: {e}")
+        raise
+
+
+def create_calendar_event(title: str, date: str, start_time: str, end_time: str, 
+                         description: str = '', location: str = '', timezone: str = 'Asia/Kolkata'):
+    """
+    Create a calendar event
+    
+    Args:
+        title: Event name
+        date: Date in 'YYYY-MM-DD' format (e.g., '2024-12-01')
+        start_time: Time in 'HH:MM' format (e.g., '14:00')
+        end_time: Time in 'HH:MM' format (e.g., '15:00')
+        description: Event description
+        location: Event location
+        timezone: Timezone (default: 'Asia/Kolkata')
+    
+    Returns:
+        Created event object
+    """
+    try:
+        service = get_calendar_service()
+        
+        # Build datetime strings
+        start_datetime = f"{date}T{start_time}:00"
+        end_datetime = f"{date}T{end_time}:00"
+        
+        event = {
+            'summary': title,
+            'location': location,
+            'description': description,
+            'start': {
+                'dateTime': start_datetime,
+                'timeZone': timezone,
+            },
+            'end': {
+                'dateTime': end_datetime,
+                'timeZone': timezone,
+            },
+            'reminders': {
+                'useDefault': False,
+                'overrides': [
+                    {'method': 'popup', 'minutes': 30},
+                    {'method': 'email', 'minutes': 1440},  # 24 hours before
+                ],
+            },
+        }
+        
+        created_event = service.events().insert(calendarId='primary', body=event).execute()
+        return created_event
+        
+    except Exception as e:
+        print(f"✗ Error creating event: {e}")
+        raise
 
 
 def extract_text_with_ocr(page, page_num, pdf_name):
@@ -1082,6 +1252,104 @@ Respond in JSON format:
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
 
 
+@app.post("/calendar")
+async def create_calendar_event_endpoint(request: CalendarRequest):
+    """
+    Create a calendar event with conflict checking.
+    If there are overlapping events, returns an error with conflict details.
+    Only creates the event if there are no conflicts.
+    """
+    if not GOOGLE_CALENDAR_AVAILABLE:
+        raise HTTPException(
+            status_code=500,
+            detail="Google Calendar libraries not available. Please install required packages."
+        )
+    
+    print("\n" + "="*80)
+    print(f"📅 Creating calendar event")
+    print(f"  Title: {request.title}")
+    print(f"  Date: {request.date}")
+    print(f"  Time: {request.start_time} - {request.end_time}")
+    print(f"  Location: {request.location}")
+    print("="*80)
+    
+    try:
+        # First, check for conflicts
+        print(f"  🔍 Checking for conflicts...")
+        conflicts = check_calendar_conflicts(
+            date=request.date,
+            start_time=request.start_time,
+            end_time=request.end_time
+        )
+        
+        if conflicts:
+            print(f"  ⚠ Found {len(conflicts)} conflicting event(s)")
+            conflict_details = []
+            for conflict in conflicts:
+                conflict_details.append({
+                    "title": conflict['title'],
+                    "start": conflict['start'],
+                    "end": conflict['end'],
+                    "location": conflict.get('location', '')
+                })
+                print(f"    - {conflict['title']} ({conflict['start']} to {conflict['end']})")
+            
+            return JSONResponse(
+                status_code=409,  # Conflict status code
+                content={
+                    "status": "conflict",
+                    "message": f"There are {len(conflicts)} overlapping event(s) at this time. Please choose a different time slot.",
+                    "conflicts": conflict_details,
+                    "requested_time": {
+                        "date": request.date,
+                        "start_time": request.start_time,
+                        "end_time": request.end_time
+                    }
+                }
+            )
+        
+        # No conflicts, proceed to create the event
+        print(f"  ✓ No conflicts found, creating event...")
+        created_event = create_calendar_event(
+            title=request.title,
+            date=request.date,
+            start_time=request.start_time,
+            end_time=request.end_time,
+            description=request.description,
+            location=request.location
+        )
+        
+        print(f"  ✓ Event created successfully!")
+        print(f"    → Link: {created_event.get('htmlLink')}")
+        print(f"    → Event ID: {created_event.get('id')}")
+        
+        return JSONResponse(content={
+            "status": "success",
+            "message": "Event created successfully",
+            "event": {
+                "id": created_event.get('id'),
+                "title": created_event.get('summary'),
+                "start": created_event['start'].get('dateTime', created_event['start'].get('date')),
+                "end": created_event['end'].get('dateTime', created_event['end'].get('date')),
+                "location": created_event.get('location', ''),
+                "htmlLink": created_event.get('htmlLink')
+            }
+        })
+        
+    except ValueError as e:
+        print(f"  ❌ Error: {str(e)}")
+        raise HTTPException(
+            status_code=400,
+            detail=str(e)
+        )
+    except Exception as e:
+        print(f"  ❌ Error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create calendar event: {str(e)}"
+        )
+
+
 if __name__ == "__main__":
     import uvicorn
     
@@ -1110,6 +1378,13 @@ if __name__ == "__main__":
     else:
         print("✓ SMTP credentials configured")
     
+    if not GOOGLE_CALENDAR_AVAILABLE:
+        print("⚠️  WARNING: Google Calendar libraries not available!")
+    elif not os.getenv("GOOGLE_CALENDAR_CREDENTIALS"):
+        print("⚠️  WARNING: GOOGLE_CALENDAR_CREDENTIALS not found!")
+    else:
+        print("✓ Google Calendar credentials configured")
+    
     print("\nPlease ensure your .env file contains:")
     print("  OPENAI_API_KEY=your-openai-api-key")
     print("  AWS_ACCESS_KEY_ID=your-aws-access-key")
@@ -1124,6 +1399,7 @@ if __name__ == "__main__":
     print("  SMTP_USERNAME=your-email@gmail.com")
     print("  SMTP_PASSWORD=your-app-password")
     print("  SMTP_FROM_EMAIL=your-email@gmail.com (optional, defaults to SMTP_USERNAME)")
+    print("  GOOGLE_CALENDAR_CREDENTIALS=your-google-calendar-credentials-json")
     print("="*80 + "\n")
     
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8080)
